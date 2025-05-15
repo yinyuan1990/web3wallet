@@ -1,0 +1,227 @@
+package com.ko.btc.activity.js
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.webkit.WebView
+import com.ko.btc.manager.AccountManager
+import com.ko.btc.manager.Web3RpcApi
+import com.ko.btc.manager.Web3RpcApi.estimateGas
+import com.ko.btc.money.model.TransferRequest
+import com.ko.btc.popup.EthSignPopup
+import com.ko.btc.popup.TronSignPopup
+import com.ko.btc.utils.Const
+import com.ko.btc.utils.TaostUtils
+import com.ko.btc.utils.WalletLogger
+import com.ko.btc.utils.coroutines.Run
+import com.ko.btc.utils.net.RpcClient
+import com.ko.btc.utils.net.TransferService.sendEvmTxFromJsonWithLoading
+import com.ko.btc.utils.net.TransferService.sendTronTransferWithLoading
+import com.ko.btc.utils.tx.hexToOkioByteString
+import com.ko.btc.utils.ui.TransactionStatusDialog
+import com.lxj.xpopup.XPopup
+
+
+import com.trustwallet.core.Ethereum
+
+import okio.ByteString.Companion.toByteString
+
+import com.trustwallet.core.AnySigner
+import com.trustwallet.core.CoinType
+import com.trustwallet.core.ethereum.SigningInput
+import com.trustwallet.core.ethereum.TransactionMode
+import com.trustwallet.core.ethereum.Transaction
+
+import com.trustwallet.core.ethereum.MessageType
+import okio.ByteString
+import org.json.JSONArray
+import org.json.JSONObject
+import java.math.BigInteger
+
+class EvmJsBridge : JsBridgeHandler {
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    override fun canHandle(method: String): Boolean {
+        return method.startsWith("eth_") || method == "personal_sign" || method == "wallet_requestPermissions"
+    }
+
+    fun toHexWithPrefix(value: BigInteger): String {
+        return "0x" + value.toString(16)
+    }
+
+
+    override fun handleMessage(webView: WebView, message: JSONObject) {
+        WalletLogger.d("📨 WebView 收到 JS 消息: --->5")
+        val method = message.getString("method")
+        val id = message.getString("id") // 必须有
+        val params = message.optJSONArray("params")
+
+        when (method) {
+            "eth_estimateGas" ->{
+                Run.onBackground {
+                    val chainId = AccountManager.getCurrentChainId()
+                    // 3. 调用通用 gas 估算函数（你刚写的）
+                    val gasLimit = estimateGas(chainId.toString(), params.optJSONObject(0))
+                    // 4. 返回结果（注意包装成 "0x" 十六进制字符串）
+                    val result = "\"0x${gasLimit.toString(16)}\""
+                    Run.onUiASync {
+                        resolveWith(webView, id, result)
+                    }
+                }
+            }
+
+            "wallet_requestPermissions" -> {
+                val resultOnly = JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("parentCapability", "eth_accounts")
+                    })
+                }
+                resolveWith(webView, id, resultOnly.toString()) // ✅ 只传 result 数组，不包裹 jsonrpc 等
+            }
+            "eth_gasPrice" ->{
+                // 假设我们从一个RPC节点获取Gas价格
+                // 这里使用的是假的 gasPrice 值，您需要替换为从链节点获取的实际 Gas 价格
+                val chainId = AccountManager.getCurrentChainId()
+                Run.onBackground {
+                    Web3RpcApi.fetchGasPrice(chainId) {
+                        var gasPrice = "0x3b9aca00" // 假设 Gas 价格是 10 Gwei
+                        if(it.equals("0")==false){
+                            gasPrice = "0x3b9aca00"
+                        }else{
+                            gasPrice = it
+                        }
+                        // 返回 gasPrice 给 DApp
+                        val result = JSONObject()
+                        result.put("jsonrpc", "2.0")
+                        result.put("id", id)
+                        result.put("result", gasPrice) // 返回 Gas 价格（十六进制表示）
+                        // 调用 resolveWith 方法来返回结果
+                        Run.onUiASync {
+                            resolveWith(webView, method, result.toString())
+                        }
+                    }
+                }
+            }
+            "eth_signTypedData_v4" -> {
+
+                val address = params?.optString(0)
+                val rawTypedData = params?.optString(1)
+                WalletLogger.d(rawTypedData!!)
+                try {
+
+                    val chainId = AccountManager.getCurrentChainId()
+                    val privateKey = AccountManager.getPrivateKey(
+                        walletId = AccountManager.getCurrentAccount()?.walletId ?: "",
+                        chainId = chainId,
+                        address = address.toString()
+                    )
+
+                    WalletLogger.d(privateKey.toString())
+                    val request = TransferRequest(
+                        from =address.toString(),
+                        to = rawTypedData,
+                        amount = "0",
+                        privateKey = privateKey.toString(),
+                        chainId = chainId,
+                        tokenAddress = "",
+                        decimals = ""
+                    )
+
+                    val popup = EthSignPopup(webView.context,request) { resultJson ->
+
+                        val signature = resultJson
+                        if(signature.contains("error")==false) {
+                            WalletLogger.d("签名成功 " + signature)
+                            resolveWith(webView, id, "\"$signature\"")
+                        }else{
+                            WalletLogger.d("签名失败 " + signature)
+
+                        }
+
+                    }
+                    XPopup.Builder(webView.context).asCustom(popup).show()
+
+
+                } catch (e: Exception) {
+                    WalletLogger.d("签名失败 "+e.message)
+                    rejectWith(webView, method, "签名失败: ${e.message}")
+                }
+            }
+
+
+            "eth_sendTransaction" -> {
+                if (params != null && params.length() > 0) {
+                    val txObject = params.getJSONObject(0)
+                    val from = txObject.getString("from")
+                    val chainId = AccountManager.getCurrentChainId()
+                    val privateKey = AccountManager.getPrivateKey(
+                        walletId = AccountManager.getCurrentAccount()?.walletId ?: "",
+                        chainId = chainId,
+                        address = from
+                    ) ?: return
+
+                    // 异步处理签名和广播
+                    (webView.context as Context).sendEvmTxFromJsonWithLoading(
+                        chainId = chainId,
+                        from = from,
+                        privateKey = privateKey,
+                        txJson = txObject
+                    ) { success, result ->
+                        val callbackJs = if (success && result != null) {
+                            """window.ethereum.__resolve && window.ethereum.__resolve("$id", "$result");"""
+                        } else {
+                            """window.ethereum.__reject && window.ethereum.__reject("$id", "交易失败");"""
+                        }
+                        Handler(Looper.getMainLooper()).post {
+
+                            WalletLogger.d(callbackJs)
+                            webView.evaluateJavascript(callbackJs, null)
+                        }
+                    }
+                } else {
+                    rejectWith(webView, id, "缺少交易参数")
+                }
+            }
+            "eth_chainId" -> {
+                val chainIdHex = "0x" + AccountManager.getCurrentAddress()!!.chainId.toInt().toString(16)
+                resolveWith(webView, id, "\"$chainIdHex\"") // 注意加引号，返回的是字符串
+            }
+            "eth_accounts", "eth_requestAccounts" -> {
+                val address = AccountManager.getCurrentAddress()!!.address
+                resolveWith(webView, id, "[\"$address\"]")
+            }
+            "personal_sign", "eth_sign" -> {
+                val fakeSig = "0x" + "f".repeat(130)
+                resolveWith(webView, id, "\"$fakeSig\"")
+            }
+            "eth_call" -> {
+                val dummyResult = "0x" + "0".repeat(64) // 64位0，模拟返回一个 uint256 = 0
+                resolveWith(webView, id, "\"$dummyResult\"")
+            }
+            else -> rejectWith(webView, id, "Unsupported method: $method")
+        }
+    }
+
+    /** Hex字符串转ByteArray */
+    fun String.hexToByteArray(): ByteArray {
+        val cleanInput = removePrefix("0x").lowercase()
+        require(cleanInput.length % 2 == 0) { "Invalid hex length" }
+        return ByteArray(cleanInput.length / 2).apply {
+            for (i in indices) {
+                this[i] = cleanInput.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+        }
+    }
+
+    private fun resolveWith(webView: WebView, id: String, resultJson: String) {
+        val js = "window.ethereum.__resolve('$id', $resultJson);"
+        mainHandler.post { webView.evaluateJavascript(js, null) }
+    }
+
+    private fun rejectWith(webView: WebView, id: String, error: String) {
+        val js = "window.ethereum.__reject('$id', \"$error\");"
+        mainHandler.post { webView.evaluateJavascript(js, null) }
+    }
+
+}
